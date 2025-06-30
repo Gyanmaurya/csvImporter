@@ -1,7 +1,140 @@
+import Papa from "papaparse";
+import { ValidationResult } from "../components/types";
+import { createCsvRowSchema } from "../components/types";
 import { z } from "zod";
 
-export const createCsvRowSchema = (headers: string[]) => {
-  // Check if email column exists in the CSV
+export const normalizePhone = (phone: string): string | null => {
+  if (!phone) return null;
+  const cleaned = phone.trim();
+  if (cleaned.startsWith('91') && cleaned.length === 12) return `+${cleaned}`;
+  if (!cleaned.startsWith('+') && cleaned.length === 10) return `+91${cleaned}`;
+  return cleaned;
+};
+
+export const validateRowsInChunks = async (
+  file: File,
+  headers: string[],
+  chunkSize: number = 30000,
+  progressCallback?: (progress: number) => void
+): Promise<ValidationResult> => {
+  return new Promise((resolve) => {
+    const validRows: Record<string, string>[] = [];
+    const invalidRows: ValidationResult['invalidRows'] = [];
+    const duplicates: ValidationResult['duplicates'] = [];
+    
+    const phoneNumberMap = new Map<string, number[]>();
+    const emailMap = new Map<string, number[]>();
+    
+    let processedRows = 0;
+    let totalRows = 0;
+    
+    // First pass to count rows
+    Papa.parse(file, {
+      preview: 1,
+      complete: (results) => {
+        totalRows = results.data.length;
+        processChunk(0);
+      }
+    });
+    
+    const processChunk = (start: number) => {
+      Papa.parse(file, {
+        header: true,
+        skipEmptyLines: true,
+        preview: chunkSize,
+        chunk: (results, parser) => {
+          const chunkData = results.data as Record<string, string>[];
+          
+          chunkData.forEach((row, indexInChunk) => {
+            const originalIndex = start + indexInChunk;
+            const errors: string[] = [];
+            const rowDuplicates: {field: string, value: string, rows: number[]}[] = [];
+            
+            // Schema validation
+            try {
+              createCsvRowSchema(headers).parse(row);
+            } catch (error) {
+              if (error instanceof z.ZodError) {
+                errors.push(...error.errors.map(err => err.message));
+              }
+            }
+            
+            // Phone number duplicate check
+            if (row.phonenumber) {
+              const phone = normalizePhone(row.phonenumber);
+              if (phone) {
+                if (!phoneNumberMap.has(phone)) {
+                  phoneNumberMap.set(phone, []);
+                }
+                const existingRows = phoneNumberMap.get(phone)!;
+                existingRows.push(originalIndex + 1); // 1-based row numbers
+                
+                if (existingRows.length > 1) {
+                  rowDuplicates.push({
+                    field: 'phonenumber',
+                    value: phone,
+                    rows: [...existingRows]
+                  });
+                  errors.push(`Duplicate phone number (also in rows: ${existingRows.slice(0, -1).join(', ')})`);
+                }
+              }
+            }
+            
+            // Email duplicate check
+            if (headers.includes("email") && row.email) {
+              const email = row.email.toLowerCase().trim();
+              if (email) {
+                if (!emailMap.has(email)) {
+                  emailMap.set(email, []);
+                }
+                const existingRows = emailMap.get(email)!;
+                existingRows.push(originalIndex + 1); // 1-based row numbers
+                
+                if (existingRows.length > 1) {
+                  rowDuplicates.push({
+                    field: 'email',
+                    value: email,
+                    rows: [...existingRows]
+                  });
+                  errors.push(`Duplicate email (also in rows: ${existingRows.slice(0, -1).join(', ')})`);
+                }
+              }
+            }
+            
+            if (errors.length > 0) {
+              invalidRows.push({
+                row,
+                errors,
+                originalIndex: originalIndex + 1
+              });
+              if (rowDuplicates.length) {
+                duplicates.push(...rowDuplicates);
+              }
+            } else {
+              validRows.push(row);
+            }
+          });
+          
+          processedRows += chunkData.length;
+          const progress = Math.round((processedRows / totalRows) * 100);
+          progressCallback?.(progress);
+          
+          if (processedRows < totalRows) {
+            parser.pause();
+            setTimeout(() => {
+              processChunk(processedRows);
+              parser.resume();
+            }, 0);
+          } else {
+            resolve({ validRows, invalidRows, duplicates });
+          }
+        }
+      });
+    };
+  });
+};
+
+const createCsvRowSchema = (headers: string[]) => {
   const hasEmailColumn = headers.includes("email");
   
   return z.object({
@@ -11,13 +144,8 @@ export const createCsvRowSchema = (headers: string[]) => {
         message: "Must be a valid Indian phone number (10 digits with 91 or +91 country code)"
       })
       .transform(val => {
-        // Normalize to +91 format
-        if (val.startsWith('91') && val.length === 12) {
-          return `+${val}`;
-        }
-        if (!val.startsWith('+') && val.length === 10) {
-          return `+91${val}`;
-        }
+        if (val.startsWith('91') && val.length === 12) return `+${val}`;
+        if (!val.startsWith('+') && val.length === 10) return `+91${val}`;
         return val;
       }),
     email: hasEmailColumn 
@@ -33,111 +161,3 @@ export const createCsvRowSchema = (headers: string[]) => {
     var3: z.string().optional(),
   });
 };
-
-export type CsvRow = ReturnType<typeof createCsvRowSchema>;
-
-// Updated validation function
-export const validateRows = (rows: Record<string, string>[], headers: string[]): {row: Record<string, string>, errors: string[]}[] => {
-  const schema = createCsvRowSchema(headers);
-  
-  // Track phone numbers and emails for duplicates
-  const phoneNumberMap = new Map<string, number[]>();
-  const emailMap = new Map<string, number[]>();
-  
-  // First pass to collect all phone numbers and emails
-  rows.forEach((row, index) => {
-    const phone = row.phonenumber?.trim();
-    if (phone) {
-      // Normalize phone number for duplicate checking
-      let normalizedPhone = phone;
-      if (phone.startsWith('91') && phone.length === 12) {
-        normalizedPhone = `+${phone}`;
-      } else if (!phone.startsWith('+') && phone.length === 10) {
-        normalizedPhone = `+91${phone}`;
-      }
-      
-      if (!phoneNumberMap.has(normalizedPhone)) {
-        phoneNumberMap.set(normalizedPhone, []);
-      }
-      phoneNumberMap.get(normalizedPhone)?.push(index);
-    }
-    
-    if (headers.includes("email")) {
-      const email = row.email?.trim().toLowerCase();
-      if (email) {
-        if (!emailMap.has(email)) {
-          emailMap.set(email, []);
-        }
-        emailMap.get(email)?.push(index);
-      }
-    }
-  });
-
-  // Second pass to validate each row
-  return rows.map((row, index) => {
-    const errors: string[] = [];
-    const normalizedRow: Record<string, string> = {};
-
-    // Normalize data
-    for (const key in row) {
-      normalizedRow[key] = row[key]?.toString().trim() || "";
-    }
-
-    // Check for completely empty row
-    if (Object.values(normalizedRow).every(val => val === "")) {
-      return { row, errors: ["Empty row - please remove"] };
-    }
-
-    // Basic schema validation
-    try {
-      schema.parse(normalizedRow);
-    } catch (error) {
-      if (error instanceof z.ZodError) {
-        errors.push(...error.errors.map(err => err.message));
-      } else {
-        errors.push("Validation error");
-      }
-    }
-
-    // Check for duplicate phone numbers (using normalized format)
-    const phone = normalizedRow.phonenumber;
-    if (phone) {
-      let normalizedPhone = phone;
-      if (phone.startsWith('91') && phone.length === 12) {
-        normalizedPhone = `+${phone}`;
-      } else if (!phone.startsWith('+') && phone.length === 10) {
-        normalizedPhone = `+91${phone}`;
-      }
-      
-      if (phoneNumberMap.get(normalizedPhone)?.length > 1) {
-        errors.push("Duplicate phone number found");
-      }
-    }
-
-    // Check for duplicate emails only if email column exists
-    if (headers.includes("email")) {
-      const email = normalizedRow.email?.toLowerCase();
-      if (email && emailMap.get(email)?.length > 1) {
-        errors.push("Duplicate email found");
-      }
-    }
-
-    return { row: normalizedRow, errors };
-  });
-};
-
-// Single row validation (when needed)
-export const validateRow = (row: Record<string, string>, headers: string[]): string[] => {
-  return validateRows([row], headers)[0].errors;
-};
-
-export function formatFileSize(sizeInBytes: number): string {
-  if (sizeInBytes === 0) return "0 Bytes";
-
-  const units = ["Bytes", "KB", "MB", "GB", "TB"];
-  const k = 1024;
-  const i = Math.floor(Math.log(sizeInBytes) / Math.log(k));
-
-  const size = (sizeInBytes / Math.pow(k, i)).toFixed(2);
-  return `${size} ${units[i]}`;
-}
